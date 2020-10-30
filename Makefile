@@ -1,4 +1,18 @@
 obj-m := pps-gpio-poll.o
 PWD := $(shell pwd)
-default:
-	$(MAKE) -C $(KDIR) HOSTCFLAGS=$(HOSTCFLAGS) CROSS_COMPILE=$(CROSS_COMPILE) ARCH=$(ARCH) KBUILD_HAVE_NLS=$(KBUILD_HAVE_NLS) CC=$(CC) M=$(shell pwd) modules_install
+# Default to running kernel's build directory if KDIR not set externally
+KDIR ?= "/lib/modules/$(shell uname -r)/build"
+ARCH=x86_64
+CONFIG_MODULE_SIG=n
+
+all:
+	$(MAKE) -C $(KDIR) ARCH=$(ARCH) M=$(shell pwd) modules
+
+install:	
+	$(MAKE) -C $(KDIR) ARCH=$(ARCH) M=$(shell pwd) modules_install
+	depmod -A
+
+clean:
+	$(MAKE) -C $(KDIR) ARCH=$(ARCH) M=$(shell pwd) clean
+
+

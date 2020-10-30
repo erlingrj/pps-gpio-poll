@@ -26,14 +26,57 @@
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 
-/* #define GPIO_ECHO */
+
+
+//#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+
+
+int gpiot_request() {
+// Export the desired pin by writing to /sys/class/gpio/export
+
+    int fd = open("/sys/class/gpio/export", O_WRONLY);
+    if (fd == -1) {
+        return -1;
+    }
+
+    if (write(fd, "243", 3) != 3) {
+        //perror("Error writing to /sys/class/gpio/export");
+        //exit(1);
+    }
+
+    close(fd);
+}
+
+int gpiot_get_value() {
+    int fd = open("/sys/class/gpio/gpio243/value", O_RDONLY);
+    if (fd == -1) {
+        pr_error("Unable to open /sys/class/gpio/gpio243/value");
+        return fd;
+    }
+    int res = read(fd,1);
+    close(fd);
+    return res;
+	
+}
+
+
+//#define GPIO_ECHO
+#define ERLING_TEST
+
 
 #ifdef CONFIG_ATH79
 #include <asm/mach-ath79/ar71xx_regs.h>
 extern void __iomem *ath79_gpio_base;
-#define gpio_get_value(gpio) ((__raw_readl(ath79_gpio_base + AR71XX_GPIO_REG_IN) >> (gpio)) & 1)
+#define gpio_get_value(gpio) ((	(ath79_gpio_base + AR71XX_GPIO_REG_IN) >> (gpio)) & 1)
 #define gpio_set_value(gpio, value) (__raw_writel(1 << (gpio), ath79_gpio_base + ((value) ? AR71XX_GPIO_REG_SET : AR71XX_GPIO_REG_CLEAR)))
 #endif
+
+#define gpio_get_value(gpio) 1
 
 static int gpio;
 #ifdef GPIO_ECHO
@@ -91,13 +134,13 @@ static int pps_gpio_register(void)
 	};
 
 	/* GPIO setup */
-	ret = gpio_request(gpio, "PPS");
-	if (ret) {
+	ret = gpio_request(gpio, "PPS_MADDAFAKKA");
+	if (ret != 0) {
 		pr_warning("failed to request PPS GPIO %u\n", gpio);
 		return -EINVAL;
 	}	
 	ret = gpio_direction_input(gpio);
-	if (ret) {
+	if (ret != 0) {
 		pr_warning("failed to set PPS GPIO direction\n");
 		goto error1;
 	}
@@ -124,6 +167,11 @@ static int pps_gpio_register(void)
 		goto error;
 	}
 
+	#ifdef ERLING_TEST
+	pr_info("Registered GPIO %d as PPS MADDAFAKKA source\n", gpio);
+	int val = gpio_get_value(gpio);
+	pr_info("gpio_get_value returned %d\n", val);
+	#else
 	ts1 = ktime_get();
 	gpio_get_value(gpio);
 
@@ -132,8 +180,11 @@ static int pps_gpio_register(void)
 		gpio_get_value(gpio);
 	ts2 = ktime_get();
 
+
 	pr_info("Registered GPIO %d as PPS source (precision %d ns)\n",
 		gpio, (int)(ktime_to_ns(ts2) - ktime_to_ns(ts1)) / 100);
+
+	#endif	
 	return 0;
 
 error:
@@ -245,11 +296,26 @@ static enum hrtimer_restart gpio_off()
 }
 #endif
 
+
 static int __init pps_gpio_init(void)
 {
+	#ifdef ERLING_TEST
+	pr_info("HELLO FROM pps_gpio_init\n");
+	pr_info("YEAH\n");
+
+	int ret = pps_gpio_register();
+	if (ret < 0)
+		return ret;
+
+	pr_info("YEAH2\n");
+
+	pps_gpio_remove();
+	
+	return 0;
+	#else
 	int ret;
 	ktime_t ktime;
-
+	
 	ret = pps_gpio_register();
 	if (ret < 0)
 		return ret;
@@ -268,6 +334,8 @@ static int __init pps_gpio_init(void)
 	#endif
 	
 	return 0;
+
+	#endif
 }
 
 static void __exit pps_gpio_exit(void)
