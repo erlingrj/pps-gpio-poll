@@ -16,6 +16,38 @@
  *   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+
+
+/**
+ *  A new version is required here. As we need to sleep when we read from the GPIO pins we
+ *  cannot use hrtimer, high resolution timer. Instead we could use:
+ *  pthreads + usleep.
+ *  
+ *  ** Init
+ *  - Request GPIO
+ *  - Configure as input
+ *  - register new PPS source
+ *  - Start the polling thread
+ * 
+ *  ** Polling thread
+ * 	- Has 2 states: 
+ * 	1. Polling for first PPS
+ * 		This is the initial state and we do a read of the gpio pin and go to a predefined sleep
+ * 		Q: How long is the Ublox pps pulse? We need to detect it
+ * 		When we have detected an event we schedule a sleep which is for a duration related to the 1Hz 1PPS
+ * 
+ *  2. Findin the PPS pulse
+ * 		When getting close to 1s since last PPS we do very frequent polling of the GPIO pin until we
+ * 		detect the event. We notify the PPS module and we do another wait.
+ * 
+ * ** Exit
+ * 	- Kill of the PPS thread
+ *  - Unregister GPIO pin as GPS souce
+ * 	- Free GPIO pin 	
+ * 
+ * 
+ * */
+
 #define pr_fmt(fmt) "pps-gpio-poll" ": " fmt
 
 #include <linux/init.h>
@@ -28,76 +60,25 @@
 
 
 
-//#include <stdio.h>
-#include <stdlib.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-
-
-int gpiot_request() {
-// Export the desired pin by writing to /sys/class/gpio/export
-
-    int fd = open("/sys/class/gpio/export", O_WRONLY);
-    if (fd == -1) {
-        return -1;
-    }
-
-    if (write(fd, "243", 3) != 3) {
-        //perror("Error writing to /sys/class/gpio/export");
-        //exit(1);
-    }
-
-    close(fd);
-}
-
-int gpiot_get_value() {
-    int fd = open("/sys/class/gpio/gpio243/value", O_RDONLY);
-    if (fd == -1) {
-        pr_error("Unable to open /sys/class/gpio/gpio243/value");
-        return fd;
-    }
-    int res = read(fd,1);
-    close(fd);
-    return res;
-	
-}
-
-
-//#define GPIO_ECHO
-#define ERLING_TEST
-
-
-#ifdef CONFIG_ATH79
-#include <asm/mach-ath79/ar71xx_regs.h>
-extern void __iomem *ath79_gpio_base;
-#define gpio_get_value(gpio) ((	(ath79_gpio_base + AR71XX_GPIO_REG_IN) >> (gpio)) & 1)
-#define gpio_set_value(gpio, value) (__raw_writel(1 << (gpio), ath79_gpio_base + ((value) ? AR71XX_GPIO_REG_SET : AR71XX_GPIO_REG_CLEAR)))
+#define I2C_GPIO
+#ifdef I2C_GPIO
+  #define pps_gpio_get_value(gpio) gpio_get_value_cansleep(gpio)
+#else
+  #define pps_gpio_get_value(gpio) gpio_get_value(gpio)
 #endif
 
-#define gpio_get_value(gpio) 1
-
-static int gpio;
-#ifdef GPIO_ECHO
-static int gpio_echo = -1;
-static int echo_invert = 1;
-#endif
+static int gpio = 243;
 static int capture = 1;
-static int poll = 100;
+static int poll = 10000;
 static int wait = 15;
 static int iter = 2000;
 static int rate = 1;
 static int interval;
-static int debug;
+static int debug = 1;
 
+/*
 module_param(gpio, int, S_IRUSR);
 MODULE_PARM_DESC(gpio, "PPS GPIO");
-#ifdef GPIO_ECHO
-module_param(gpio_echo, int, S_IRUSR);
-MODULE_PARM_DESC(gpio_echo, "PPS echo GPIO");
-module_param(echo_invert, int, S_IRUSR | S_IWUSR);
-#endif
 module_param(capture, int, S_IRUSR | S_IWUSR);
 MODULE_PARM_DESC(capture, "capture PPS event: 0 = falling, 1 = rising");
 module_param(poll, int, S_IRUSR | S_IWUSR);
@@ -109,14 +90,11 @@ MODULE_PARM_DESC(rate, "PPS rate (Hz)");
 module_param(rate, int, S_IRUSR | S_IWUSR);
 MODULE_PARM_DESC(iter, "maximum number of GPIO reads in the wait loop");
 module_param(debug, int, S_IRUSR | S_IWUSR);
-
+*/
 
 static struct pps_device *pps;
 static ktime_t last_ts;
 static struct hrtimer timer;
-#ifdef GPIO_ECHO
-static struct hrtimer echo_timer;
-#endif
 static int gpio_value;
 
 static int pps_gpio_register(void)
@@ -144,20 +122,7 @@ static int pps_gpio_register(void)
 		pr_warning("failed to set PPS GPIO direction\n");
 		goto error1;
 	}
-	#ifdef GPIO_ECHO
-	if (gpio_echo >= 0) {
-		ret = gpio_request(gpio_echo, "PPS echo");
-		if (ret) {
-			pr_warning("failed to request PPS echo GPIO %u\n", gpio_echo);
-			goto error1;
-		}
-		ret = gpio_direction_output(gpio_echo, 0);
-		if (ret) {
-			pr_warning("failed to set PPS echo GPIO direction\n");
-			goto error;
-		}
-	}
-	#endif
+	
 	
 	/* register PPS source */
 	pps_default_params = PPS_CAPTUREASSERT | PPS_OFFSETASSERT;
@@ -167,31 +132,21 @@ static int pps_gpio_register(void)
 		goto error;
 	}
 
-	#ifdef ERLING_TEST
-	pr_info("Registered GPIO %d as PPS MADDAFAKKA source\n", gpio);
-	int val = gpio_get_value(gpio);
-	pr_info("gpio_get_value returned %d\n", val);
-	#else
 	ts1 = ktime_get();
-	gpio_get_value(gpio);
+	pps_gpio_get_value(gpio);
 
 	ts1 = ktime_get();
 	for (i = 0; i < 100; i++)
-		gpio_get_value(gpio);
+		pps_gpio_get_value(gpio);
 	ts2 = ktime_get();
 
 
 	pr_info("Registered GPIO %d as PPS source (precision %d ns)\n",
 		gpio, (int)(ktime_to_ns(ts2) - ktime_to_ns(ts1)) / 100);
 
-	#endif	
 	return 0;
 
 error:
-	#ifdef GPIO_ECHO
-	if (gpio_echo >= 0)
-		gpio_free(gpio_echo);
-	#endif
 error1:
 	gpio_free(gpio);
 	return -EINVAL;
@@ -200,10 +155,7 @@ error1:
 static int pps_gpio_remove(void)
 {
 	gpio_free(gpio);
-	#ifdef GPIO_ECHO
-	if (gpio_echo >= 0)
-		gpio_free(gpio_echo);
-	#endif
+
 	pps_unregister_source(pps);
 	pr_info("Removed GPIO %d as PPS source\n", gpio);
 	return 0;
@@ -212,9 +164,14 @@ static int pps_gpio_remove(void)
 static enum hrtimer_restart gpio_wait(struct hrtimer *t);
 static enum hrtimer_restart gpio_poll(struct hrtimer *t)
 {
-	ktime_t ktime = ktime_set(0, poll*1000);
+		unsigned long flags;
 
-	int value = gpio_get_value(gpio);
+	pr_info("gpio_poll called\n");
+	ktime_t ktime = ktime_set(0, poll*1000);
+		local_irq_save(flags);
+	local_irq_restore(flags);
+
+	int value = pps_gpio_get_value(gpio);
 	if (value != gpio_value) {
 		if (value == capture) {
 			/* got a PPS event, start busy waiting 1.5*poll microseconds
@@ -226,7 +183,7 @@ static enum hrtimer_restart gpio_poll(struct hrtimer *t)
 		gpio_value = value;
 	}
 
-	hrtimer_start(&timer, ktime, HRTIMER_MODE_REL);
+	//hrtimer_start(&timer, ktime, HRTIMER_MODE_REL);
 
 	return HRTIMER_NORESTART;
 }
@@ -242,12 +199,9 @@ static enum hrtimer_restart gpio_wait(struct hrtimer *t)
 	/* read the GPIO value until the PPS event happens */
 	local_irq_save(flags);
 	pps_get_ts(&ts);
-	for (i = 0; likely(i < iter && gpio_get_value(gpio) != capture); i++) {
+	for (i = 0; likely(i < iter && pps_gpio_get_value(gpio) != capture); i++) {
 	}
-	#ifdef GPIO_ECHO
-	if (gpio_echo >= 0 && likely(i > 0 && i < iter))
-		gpio_set_value(gpio_echo, !echo_invert);
-	#endif
+
 	pps_get_ts(&ts);
 	monotonic = ktime_get();
 	local_irq_restore(flags);
@@ -276,10 +230,6 @@ static enum hrtimer_restart gpio_wait(struct hrtimer *t)
 
 	if (have_ts) {
 		pps_event(pps, &ts, capture ? PPS_CAPTUREASSERT : PPS_CAPTURECLEAR, NULL);
-		#ifdef GPIO_ECHO
-		if (gpio_echo >= 0)
-			hrtimer_start(&echo_timer, ktime_set(0, 5e8L), HRTIMER_MODE_REL);
-		#endif
 	}
 	if (debug)
 		pr_info("%d GPIO reads\n", i);
@@ -287,32 +237,11 @@ static enum hrtimer_restart gpio_wait(struct hrtimer *t)
 	return HRTIMER_NORESTART;
 }
 
-#ifdef GPIO_ECHO
-static enum hrtimer_restart gpio_off()
-{
-	if (gpio_echo >= 0)
-		gpio_set_value(gpio_echo, echo_invert);
-	return HRTIMER_NORESTART;	
-}
-#endif
 
 
 static int __init pps_gpio_init(void)
 {
-	#ifdef ERLING_TEST
-	pr_info("HELLO FROM pps_gpio_init\n");
-	pr_info("YEAH\n");
 
-	int ret = pps_gpio_register();
-	if (ret < 0)
-		return ret;
-
-	pr_info("YEAH2\n");
-
-	pps_gpio_remove();
-	
-	return 0;
-	#else
 	int ret;
 	ktime_t ktime;
 	
@@ -320,7 +249,7 @@ static int __init pps_gpio_init(void)
 	if (ret < 0)
 		return ret;
 
-	gpio_value = gpio_get_value(gpio);
+	gpio_value = pps_gpio_get_value(gpio);
 	interval = 1000000 / rate;
 
 	hrtimer_init(&timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -328,24 +257,22 @@ static int __init pps_gpio_init(void)
 	ktime = ktime_set(0, 1000000);
 	hrtimer_start(&timer, ktime, HRTIMER_MODE_REL);
 	
-	#ifdef GPIO_ECHO
-	hrtimer_init(&echo_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	echo_timer.function = &gpio_off;
-	#endif
+
 	
 	return 0;
 
-	#endif
 }
 
 static void __exit pps_gpio_exit(void)
 {
 	hrtimer_cancel(&timer);
-	#ifdef GPIO_ECHO
-	hrtimer_cancel(&echo_timer);
-	#endif
+
 	pps_gpio_remove();
 }
+
+
+
+
 
 
 module_init(pps_gpio_init);
